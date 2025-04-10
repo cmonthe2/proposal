@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+import boto3
+import argparse
+import json
+import os
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Generate Terraform import commands for existing AWS resources')
+    parser.add_argument('--service', required=True, help='AWS service (e.g., ec2, rds, s3)')
+    parser.add_argument('--region', default='us-west-2', help='AWS region')
+    parser.add_argument('--profile', help='AWS profile name')
+    parser.add_argument('--env', required=True, help='Environment (e.g., development, staging, production)')
+    parser.add_argument('--module-path', required=True, help='Terraform module path')
+    return parser.parse_args()
+
+def get_boto3_client(service, region, profile=None):
+    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
+    return session.client(service, region_name=region)
+
+def get_resource_imports(service, client, module_path, env):
+    imports = []
+    
+    if service == 'ec2':
+        # Get VPCs
+        vpcs = client.describe_vpcs()
+        for vpc in vpcs['Vpcs']:
+            if 'Tags' in vpc:
+                for tag in vpc['Tags']:
+                    if tag['Key'] == 'Environment' and tag['Value'].lower() == env.lower():
+                        imports.append({
+                            'resource_type': 'aws_vpc',
+                            'resource_name': f'main',
+                            'resource_id': vpc['VpcId'],
+                            'module_address': f'module.networking'
+                        })
+        
+        # Get subnets
+        subnets = client.describe_subnets()
+        for subnet in subnets['Subnets']:
+            if 'Tags' in subnet:
+                for tag in subnet['Tags']:
+                    if tag['Key'] == 'Environment' and tag['Value'].lower() == env.lower():
+                        subnet_type = None
+                        subnet_index = None
+                        
+                        for tag in subnet['Tags']:
+                            if tag['Key'] == 'Name':
+                                if 'public' in tag['Value'].lower():
+                                    subnet_type = 'public'
+                                elif 'private' in tag['Value'].lower():
+                                    subnet_type = 'private'
+                                
+                                # Try to extract index from name (e.g., "prod-public-subnet-1")
+                                parts = tag['Value'].split('-')
+                                if parts and parts[-1].isdigit():
+                                    subnet_index = int(parts[-1]) - 1
+                        
+                        if subnet_type and subnet_index is not None:
+                            imports.append({
+                                'resource_type': 'aws_subnet',
+                                'resource_name': f'{subnet_type}[{subnet_index}]',
+                                'resource_id': subnet['SubnetId'],
+                                'module_address': f'module.networking'
+                            })
+    
+    elif service == 'rds':
+        # Get RDS instances
+        dbs = client.describe_db_instances()
+        for db in dbs['DBInstances']:
+            db_id = db['DBInstanceIdentifier']
+            if env.lower() in db_id.lower():
+                imports.append({
+                    'resource_type': 'aws_db_instance',
+                    'resource_name': 'main',
+                    'resource_id': db_id,
+                    'module_address': 'module.database'
+                })
+    
+    elif service == 's3':
+        # Get S3 buckets
+        buckets = client.list_buckets()
+        for bucket in buckets['Buckets']:
+            bucket_name = bucket['Name']
+            if env.lower() in bucket_name.lower():
+                # Check if bucket belongs to environment resources or global
+                module_address = 'module.storage'
+                if 'terraform-state' in bucket_name or 'tfstate' in bucket_name:
+                    module_address = '../../global/s3'
+                
+                imports.append({
+                    'resource_type': 'aws_s3_bucket',
+                    'resource_name': bucket_name.replace('-', '_'),
+                    'resource_id': bucket_name,
+                    'module_address': module_address
+                })
+    
+    # Add more services as needed
+    
+    return imports
+
+def generate_import_commands(imports, env, module_path):
+    commands = []
+    
+    # Create directory if it doesn't exist
+    os.makedirs(f'terraform-imports/{env}', exist_ok=True)
+    import_file = f'terraform-imports/{env}/import_{len(imports)}_resources.sh'
+    
+    with open(import_file, 'w') as f:
+        f.write('#!/bin/bash\n\n')
+        f.write(f'cd {module_path}\n\n')
+        
+        for imp in imports:
+            cmd = f"terraform import {imp['module_address']}.{imp['resource_type']}.{imp['resource_name']} {imp['resource_id']}"
+            f.write(f"{cmd}\n")
+            commands.append(cmd)
+    
+    # Make the file executable
+    os.chmod(import_file, 0o755)
+    
+    return commands, import_file
+
+def main():
+    args = parse_args()
+    client = get_boto3_client(args.service, args.region, args.profile)
+    
+    print(f"Discovering {args.service} resources in {args.region} for environment {args.env}...")
+    imports = get_resource_imports(args.service, client, args.module_path, args.env)
+    
+    if imports:
+        commands, import_file = generate_import_commands(imports, args.env, args.module_path)
+        print(f"\nGenerated {len(commands)} import commands in {import_file}")
+        print(f"\nRun the following to import resources:\n\n$ {import_file}")
+    else:
+        print(f"No {args.service} resources found for environment {args.env}")
+
+if __name__ == "__main__":
+    main()
